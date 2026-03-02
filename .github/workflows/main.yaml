@@ -13,15 +13,31 @@ on:
         description: 'Nightly workflow.'
         required: true
         type: string
-        default: 'false'
+      run_api_leak_detector:
+        description: 'Whether to run the api leak detector.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       datadog_api_key:
+        required: false
+      sccache_gcs_key:
         required: false
 
 concurrency:
   # Cancel existing jobs on the same workflow, platform, and branch (or sha if merged).
-  group: ${{ github.workflow }}-${{ inputs.platform }} @ ${{ github.head_ref || github.sha }}
+  group: ${{ github.workflow }}-${{ inputs.platform }} @ ${{ github.head_ref || github.sha }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # List of folders used by CI actions that don't need a full source checkout.
+  # All files in the root directory are automatically included.
+  CI_ESSENTIALS: |
+    .github
+    cobalt/build
+    cobalt/docker
+    cobalt/testing/filters
+    cobalt/tools
 
 jobs:
   # Retrieves configuration from json file.
@@ -32,33 +48,23 @@ jobs:
     env:
       # Tell gclient not to automatically update depot tools every time it runs.
       DEPOT_TOOLS_UPDATE: 0
+      DEPOT_TOOLS_REPORT_BUILD: 0
+      DEPOT_TOOLS_COLLECT_METRICS: 0
+      DEPOT_TOOLS_METRICS: 0
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_PR_REPO_URL: ${{ github.event.pull_request.base.repo.url }}
       GITHUB_EVENT_NUMBER: ${{ github.event.number }}
     if: |
       github.event.action != 'labeled' ||
-      (github.event.pull_request.merged == false && github.event.label.name == 'runtest')
+      (github.event.pull_request.merged == false && (github.event.label.name == 'runtest' || github.event.label.name == 'yts_playback_test'))
     timeout-minutes: 10
     steps:
-      - name: Checkout
+      - name: Restore CI Essentials
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Cache CI Essentials
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-essentials-${{ inputs.platform }}
-          include-hidden-files: true
-          retention-days: 14
-          path: |
-            .github
-            cobalt/build
-            cobalt/testing/filters
-            cobalt/tools/on_device*
-            cobalt/tools/requirements*
-            cobalt/docker
-            docker-compose.yml
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Remove runtest if exists
         if: github.event_name == 'pull_request'
         continue-on-error: true  # Ignore this step if we cannot remove the label.
@@ -77,13 +83,31 @@ jobs:
           set -x
           platforms=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -c '.platforms')
           echo "platforms=${platforms}" >> $GITHUB_OUTPUT
+      - name: Select build runners
+        id: set-build-runners
+        shell: bash
+        run: |
+          set -x
+          build_runners=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -c '.build_runners // ["self-hosted", "chrobalt-linux-runner"]' )
+          echo "build_runners=${build_runners}" >> $GITHUB_OUTPUT
       - name: Set build targets
         id: set-targets
         shell: bash
         run: |
           set -x
-          targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.targets  | join(" ")')
+          targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.targets')
           echo "targets=${targets}" >> $GITHUB_OUTPUT
+      - name: Set build configs
+        id: set-build-configs
+        shell: bash
+        run: |
+          set -x
+          # Attempt to load build configs from JSON. If not present use default.
+          build_configs=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.build_configs')
+          if [[ "${build_configs}" == "null" ]]; then
+            build_configs='["devel", "qa", "gold"]'
+          fi
+          echo "build_configs=${build_configs}" >> $GITHUB_OUTPUT
       - name: Set platform extra includes
         id: set-includes
         shell: bash
@@ -96,7 +120,7 @@ jobs:
         shell: bash
         run: |
           set -x
-          docker_service=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -r '.docker_service')
+          docker_service=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -r '.docker_service // empty')
           echo "docker_service=${docker_service}" >> $GITHUB_OUTPUT
       - name: Set on-host tests
         id: set-test-on-host
@@ -112,6 +136,13 @@ jobs:
           set -x
           test_on_device=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_on_device')
           echo "test_on_device=${test_on_device}" >> $GITHUB_OUTPUT
+      - name: Set test package
+        id: set-test-package
+        shell: bash
+        run: |
+          set -x
+          test_package=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_package')
+          echo "test_package=${test_package}" >> $GITHUB_OUTPUT
       - name: Set e2e tests
         id: set-test-e2e
         shell: bash
@@ -126,6 +157,34 @@ jobs:
           set -x
           test_yts=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_yts')
           echo "test_yts=${test_yts}" >> $GITHUB_OUTPUT
+      - name: Set YTS Playback tests
+        id: set-test-yts-playback
+        shell: bash
+        run: |
+          set -x
+          test_yts_playback=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_yts_playback')
+          echo "test_yts_playback=${test_yts_playback}" >> $GITHUB_OUTPUT
+      - name: Set Browser tests
+        id: set-test-browser
+        shell: bash
+        run: |
+          set -x
+          test_browser=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_browser')
+          echo "test_browser=${test_browser}" >> $GITHUB_OUTPUT
+      - name: Set YTS WPT tests
+        id: set-test-yts-wpt
+        shell: bash
+        run: |
+          set -x
+          test_yts_wpt=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.test_yts_wpt')
+          echo "test_yts_wpt=${test_yts_wpt}" >> $GITHUB_OUTPUT
+      - name: Set web tests
+        id: set-web-tests
+        shell: bash
+        run: |
+          set -x
+          web_tests=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.web_tests')
+          echo "web_tests=${web_tests}" >> $GITHUB_OUTPUT
       - name: Set root target for unit tests
         id: set-test-root-target
         shell: bash
@@ -147,6 +206,27 @@ jobs:
           set -x
           yts_test_targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.yts_test_targets // []')
           echo "yts_test_targets=${yts_test_targets}" >> $GITHUB_OUTPUT
+      - name: Set YTS Playback test targets
+        id: set-yts-playback-test-targets
+        shell: bash
+        run: |
+          set -x
+          yts_playback_test_targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.yts_playback_test_targets // []')
+          echo "yts_playback_test_targets=${yts_playback_test_targets}" >> $GITHUB_OUTPUT
+      - name: Set Browser test targets
+        id: set-browser-test-targets
+        shell: bash
+        run: |
+          set -x
+          browser_test_targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.browser_test_targets // []')
+          echo "browser_test_targets=${browser_test_targets}" >> $GITHUB_OUTPUT
+      - name: Set YTS WPT test targets
+        id: set-yts-wpt-test-targets
+        shell: bash
+        run: |
+          set -x
+          yts_wpt_test_targets=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -cr '.yts_wpt_test_targets // []')
+          echo "yts_wpt_test_targets=${yts_wpt_test_targets}" >> $GITHUB_OUTPUT
       - name: Set E2E test targets
         id: set-e2e-test-targets
         shell: bash
@@ -174,60 +254,78 @@ jobs:
         run: |
           set -x
           # Retrieve number of shards from config. If not specified, default to 1 shard with `echo 1`.
-          num_gtest_shards=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.num_gtest_shards' || echo 1)
+          num_gtest_shards=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.num_gtest_shards // 1' )
           echo "num_gtest_shards=${num_gtest_shards}" >> $GITHUB_OUTPUT
 
           # Create a zero-indexed list of shards for use by matrix, e.g. [0,1,2,3,4,5].
           gtest_shards="[$(seq -s, 0 1 $((${num_gtest_shards} - 1)))]"
           echo "gtest_shards=${gtest_shards}" >> $GITHUB_OUTPUT
+      - name: Set enable sccache
+        id: set-enable-sccache
+        shell: bash
+        run: |
+          set -x
+          enable_sccache=$(cat ${GITHUB_WORKSPACE}/.github/config/${{ inputs.platform }}.json | jq -rc '.enable_sccache')
+          echo "enable_sccache=${enable_sccache}" >> $GITHUB_OUTPUT
+      - name: Set Docker files checksum
+        id: set-docker-hash
+        shell: bash
+        run: |
+          set -x
+          docker_content_sha=$(find cobalt/docker docker-compose.yaml -type f -exec sha256sum -b {} + | LC_ALL=C sort | sha256sum | head -c 64)
+          echo "docker_content_sha=${docker_content_sha}" >> $GITHUB_OUTPUT
     outputs:
       platforms: ${{ steps.set-platforms.outputs.platforms }}
+      build_runners: ${{ steps.set-build-runners.outputs.build_runners }}
       targets: ${{ steps.set-targets.outputs.targets }}
+      build_configs: ${{ steps.set-build-configs.outputs.build_configs }}
       includes: ${{ steps.set-includes.outputs.includes }}
       docker_service: ${{ steps.set-docker-service.outputs.docker_service }}
+      docker_content_sha: ${{ steps.set-docker-hash.outputs.docker_content_sha }}
       gtest_shards: ${{ steps.set-gtest-shards.outputs.gtest_shards }}
       test_on_host: ${{ steps.set-test-on-host.outputs.test_on_host }}
       test_on_device: ${{ steps.set-test-on-device.outputs.test_on_device }}
+      test_package: ${{ steps.set-test-package.outputs.test_package }}
       test_e2e: ${{ steps.set-test-e2e.outputs.test_e2e }}
       test_yts: ${{ steps.set-test-yts.outputs.test_yts }}
+      test_yts_playback: ${{ steps.set-test-yts-playback.outputs.test_yts_playback }}
+      test_browser: ${{ steps.set-test-browser.outputs.test_browser }}
+      test_yts_wpt: ${{ steps.set-test-yts-wpt.outputs.test_yts_wpt }}
+      web_tests: ${{ steps.set-web-tests.outputs.web_tests }}
       test_root_target: ${{ steps.set-test-root-target.outputs.test_root_target }}
       test_device_family: ${{ steps.set-test-device-family.outputs.test_device_family }}
       yts_test_targets: ${{ steps.set-yts-test-targets.outputs.yts_test_targets }}
+      yts_playback_test_targets: ${{ steps.set-yts-playback-test-targets.outputs.yts_playback_test_targets }}
+      browser_test_targets: ${{ steps.set-browser-test-targets.outputs.browser_test_targets }}
+      yts_wpt_test_targets: ${{ steps.set-yts-wpt-test-targets.outputs.yts_wpt_test_targets }}
       e2e_test_targets: ${{ steps.set-e2e-test-targets.outputs.e2e_test_targets }}
       test_dimensions: ${{ steps.set-test-dimensions.outputs.test_dimensions }}
       test_attempts: ${{ steps.set-test-attempts.outputs.test_attempts }}
       num_gtest_shards: ${{ steps.set-gtest-shards.outputs.num_gtest_shards }}
+      enable_sccache: ${{ steps.set-enable-sccache.outputs.enable_sccache }}
 
   # Builds, tags, and pushes Cobalt docker build images to ghr.
   docker-build-image:
     needs: [initialize]
     runs-on: [self-hosted, chrobalt-linux-runner]
     steps:
-    - name: Restore CI Essentials
-      uses: actions/download-artifact@v4
-      with:
-        name: ci-essentials-${{ inputs.platform }}
-    # Handle GitHub registry used for everything other than pull requests off forked repos.
-    - name: Login to GitHub Docker Registry
-      uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build docker image
-      id: build-docker-image
-      uses: ./.github/actions/docker
-      with:
-        docker_service: ${{ needs.initialize.outputs.docker_service }}
-    - name: Set Docker Tag Output
-      id: set-docker-tag-output
-      shell: bash
-      run: |
-        set -u
-        echo $DOCKER_TAG
-        echo "docker_tag=$DOCKER_TAG" | head -n 1  >> $GITHUB_OUTPUT
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Build docker image
+        if: needs.initialize.outputs.docker_service != ''
+        id: build-docker-image
+        uses: ./.github/actions/docker
+        with:
+          docker_service: ${{ needs.initialize.outputs.docker_service }}
+          is_pr: ${{ (github.event_name == 'pull_request') }}
+          docker_content_sha: ${{ needs.initialize.outputs.docker_content_sha }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
     outputs:
-      docker_tag: ${{ steps.set-docker-tag-output.outputs.docker_tag }}
+      docker_tag: ${{ steps.build-docker-image.outputs.docker_tag }}
 
   # Builds, tags, and pushes Cobalt unit test image to ghr.
   docker-unittest-image:
@@ -236,42 +334,60 @@ jobs:
     runs-on: [self-hosted, chrobalt-linux-runner]
     steps:
       - name: Restore CI Essentials
-        uses: actions/download-artifact@v4
+        uses: actions/checkout@v4
         with:
-          name: ci-essentials-${{ inputs.platform }}
-      - name: Login to GitHub Docker Registry
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Build docker image
         id: build-docker-image
         uses: ./.github/actions/docker
         with:
           docker_service: unittest
-      - name: Set Docker Tag Output
-        id: set-docker-unittest-tag-output
-        shell: bash
-        run: |
-          set -u
-          echo $DOCKER_TAG
-          echo "docker_unittest_tag=$DOCKER_TAG" | head -n 1 >> $GITHUB_OUTPUT
+          is_pr: ${{ (github.event_name == 'pull_request') }}
+          docker_content_sha: ${{ needs.initialize.outputs.docker_content_sha }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
     outputs:
-      docker_unittest_tag: ${{ steps.set-docker-unittest-tag-output.outputs.docker_unittest_tag }}
+      docker_tag: ${{ steps.build-docker-image.outputs.docker_tag }}
+
+  # Builds, tags, and pushes Cobalt web test image to ghr.
+  docker-webtest-image:
+    if: needs.initialize.outputs.web_tests == 'true'
+    needs: [initialize]
+    runs-on: [self-hosted, chrobalt-linux-runner]
+    steps:
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Build docker image
+        id: build-docker-image
+        uses: ./.github/actions/docker
+        with:
+          docker_service: webtest
+          is_pr: ${{ (github.event_name == 'pull_request') }}
+          docker_content_sha: ${{ needs.initialize.outputs.docker_content_sha }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      docker_tag: ${{ steps.build-docker-image.outputs.docker_tag }}
 
   build:
     needs: [initialize, docker-build-image]
     permissions: {}
-    runs-on: [self-hosted, chrobalt-linux-runner]
+    runs-on: ${{ fromJSON(needs.initialize.outputs.build_runners) }}
     name: ${{ matrix.name }}_${{ matrix.config }}
     strategy:
       fail-fast: false
       matrix:
         platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
         include: ${{ fromJson(needs.initialize.outputs.includes) }}
-        config: [devel, qa, gold]
-    container: ${{ needs.docker-build-image.outputs.docker_tag }}
+        config: ${{ fromJson(needs.initialize.outputs.build_configs) }}
+    container:
+      image: ${{ needs.docker-build-image.outputs.docker_tag }}
+      volumes:
+        - /runner-cache:/runner-cache
     env:
       TEST_ARTIFACTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_artifacts
       DEPOT_TOOLS_UPDATE: 0
@@ -279,35 +395,70 @@ jobs:
       DEPOT_TOOLS_COLLECT_METRICS: 0
       DEPOT_TOOLS_METRICS: 0
       IS_CI: 1
-      # We want temp folder to be on tmpfs which makes workloads faster.
-      # However, dind container ends up having / folder mounted on overlay
-      # filesystem, whereas /__w which contains Cobalt source code is on tmpfs.
-      TMPDIR: /__w/_temp
     steps:
-      - name: Checkout
+      - name: Set TMPDIR
+        shell: bash
+        run: |
+          set -x
+          if [[ -w /__w/_temp/ ]]; then
+            # We want temp folder to be on tmpfs which makes workloads faster.
+            # However, dind container ends up having / folder mounted on overlay
+            # filesystem, whereas /__w which contains Cobalt source code is on tmpfs.
+            echo "TMPDIR=/__w/_temp" >> $GITHUB_ENV
+          else
+            echo "TMPDIR=${{ runner.temp }}" >> $GITHUB_ENV
+          fi
+      - name: Restore CI Essentials
         uses: actions/checkout@v4
-        # TODO(bug?): android debug builds are broken.
-        if: ${{ ! (contains(matrix.platform, 'android') && matrix.config == 'debug') }}
         with:
-          path: src
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Checkout
+        uses: ./.github/actions/checkout
+        with:
+          path: cobalt/src
+          ref: ${{ github.sha }}
           # Set fetch-depth to 2 to make checkout faster for pull requests and cobalt_sandbox repo.
           # Set fetch-dept to 0 for non pull request workflows in production repo which is needed
           # to properly calculate build id.
-          fetch-depth: ${{ ( github.event_name == 'pull_request' || github.repository == 'youtube/cobalt_sandbox' ) && 2 || 0 }}
+          fetch_depth: ${{ ( github.event_name == 'pull_request' || github.repository == 'youtube/cobalt_sandbox' ) && 2 || 0 }}
+          use_cache: true
+
       - name: Set Up Depot Tools
-        uses: ./src/.github/actions/depot_tools
+        id: setup-depot-tools
+        uses: ./.github/actions/depot_tools
+
       - name: Build Cobalt
         id: build
-        uses: ./src/.github/actions/build
+        uses: ./.github/actions/build
         # TODO(bug?): android debug builds are broken.
         if: ${{ ! (contains(matrix.platform, 'android') && matrix.config == 'debug') }}
         with:
           targets: ${{ needs.initialize.outputs.targets }}
-          test_artifacts_key: ${{ env.TEST_ARTIFACTS_KEY }}
           test_root_target: ${{ needs.initialize.outputs.test_root_target }}
           test_targets_json_file: out/${{ matrix.platform }}_${{ matrix.config }}/test_targets.json
-          upload_on_host_test_artifacts: ${{ matrix.config == 'devel' && needs.initialize.outputs.test_on_host == 'true' }}
-          upload_on_device_test_artifacts: ${{ matrix.config == 'devel' && ( needs.initialize.outputs.test_on_device == 'true' || needs.initialize.outputs.test_e2e == 'true' ) }}
+          enable_sccache: ${{ needs.initialize.outputs.enable_sccache == 'true' }}
+          sccache_gcs_key: ${{ secrets.sccache_gcs_key }}
+
+      - name: Release Package
+        if:  (matrix.config == 'qa' || matrix.config == 'gold') && (needs.initialize.outputs.test_package == 'true' || needs.initialize.outputs.test_e2e == 'true' || needs.initialize.outputs.test_yts == 'true')
+        uses: ./.github/actions/package
+        with:
+          package_dir: out/test-package
+
+      - name: Upload Test Artifacts
+        uses: ./.github/actions/upload_test_artifacts
+        with:
+          test_artifacts_key: ${{ env.TEST_ARTIFACTS_KEY }}
+          upload_on_host_test_artifacts: ${{ matrix.config == 'devel' && (needs.initialize.outputs.test_on_host == 'true' || needs.initialize.outputs.web_tests == 'true') }}
+          upload_on_device_test_artifacts: ${{ matrix.config == 'devel' && needs.initialize.outputs.test_on_device == 'true' }}
+          upload_e2e_test_artifacts: ${{ matrix.config == 'qa' && (needs.initialize.outputs.test_e2e == 'true' || needs.initialize.outputs.test_yts == 'true') }}
+          test_targets_json_file: out/${{ matrix.platform }}_${{ matrix.config }}/test_targets.json
+
+      - name: Run API Leak Detector
+        uses: ./.github/actions/api_leak_detector
+        if: inputs.run_api_leak_detector
 
   on-device-test:
     needs: [initialize, build]
@@ -331,9 +482,11 @@ jobs:
       TEST_RESULTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_results
     steps:
       - name: Restore CI Essentials
-        uses: actions/download-artifact@v4
+        uses: actions/checkout@v4
         with:
-          name: ci-essentials-${{ inputs.platform }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Parse Test Target JSON
         id: test-target-json
         uses: ./.github/actions/test_targets_json
@@ -341,6 +494,7 @@ jobs:
         if: ${{ fromJson(steps.test-target-json.outputs.test_targets_count) > 0 }}
         uses: ./.github/actions/on_device_tests
         with:
+          nightly: ${{ inputs.nightly }}
           test_targets_json: ${{ steps.test-target-json.outputs.test_targets_json }}
           test_results_key: ${{ env.TEST_RESULTS_KEY }}
           gcs_results_path: gs://cobalt-unittest-storage/results/${{ matrix.name }}/${{ github.run_id }}/${{ github.run_attempt }}
@@ -371,14 +525,19 @@ jobs:
         include: ${{ fromJson(needs.initialize.outputs.includes) }}
         config: [devel]
     steps:
-      - name: Checkout
+      - name: Restore CI Essentials
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Run E2E Tests
         uses: ./.github/actions/internal_tests
         with:
           test_type: 'e2e_test'
           test_targets: '${{ needs.initialize.outputs.e2e_test_targets }}'
           test_dimensions: '${{ needs.initialize.outputs.test_dimensions }}'
+          test_device_family: '${{ needs.initialize.outputs.test_device_family}}'
 
   yts-test:
     needs: [initialize, build]
@@ -401,19 +560,113 @@ jobs:
         include: ${{ fromJson(needs.initialize.outputs.includes) }}
         config: [devel]
     steps:
-      - name: Checkout
+      - name: Restore CI Essentials
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Run YTS Tests
         uses: ./.github/actions/internal_tests
         with:
           test_type: 'yts_test'
           test_targets: '${{ needs.initialize.outputs.yts_test_targets }}'
 
+  yts-playback-test:
+    needs: [initialize, build]
+    # Run YTS Playback tests via presumit.
+    if: |
+      needs.initialize.outputs.test_yts_playback == 'true' &&
+        (
+          github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'yts_playback_test')
+        )
+    runs-on: [self-hosted, odt-runner]
+    name: ${{ matrix.name }}_yts_playback_tests
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
+        include: ${{ fromJson(needs.initialize.outputs.includes) }}
+        config: [devel]
+    steps:
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Run YTS Playback Tests
+        uses: ./.github/actions/internal_tests
+        with:
+          test_type: 'yts_test'
+          test_targets: '${{ needs.initialize.outputs.yts_playback_test_targets }}'
+
+  browser-test:
+    needs: [initialize, build]
+    if: |
+      needs.initialize.outputs.test_browser == 'true' &&
+        (
+          (github.event_name == 'pull_request' && github.event.pull_request.draft == false ) ||
+          (inputs.nightly == 'true' || github.event_name == 'schedule') ||
+          (github.event_name == 'push')
+        )
+    runs-on: [self-hosted, odt-runner]
+    name: ${{ matrix.name }}_browser_tests
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
+        include: ${{ fromJson(needs.initialize.outputs.includes) }}
+        config: [devel]
+    steps:
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Run Browser Tests
+        uses: ./.github/actions/internal_tests
+        with:
+          test_type: 'browser_test'
+          test_targets: '${{ needs.initialize.outputs.browser_test_targets }}'
+
+  yts-wpt-test:
+    needs: [initialize, build]
+    if: |
+      needs.initialize.outputs.test_yts_wpt == 'true' &&
+        (
+          (inputs.nightly == 'true' || github.event_name == 'schedule') ||
+          (github.event_name == 'push')
+        )
+    runs-on: [self-hosted, odt-runner]
+    name: ${{ matrix.name }}_yts_wpt_tests
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
+        include: ${{ fromJson(needs.initialize.outputs.includes) }}
+        config: [devel]
+    steps:
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Run YTS WPT Tests
+        uses: ./.github/actions/internal_tests
+        with:
+          test_type: 'yts_wpt_test'
+          test_targets: '${{ needs.initialize.outputs.yts_wpt_test_targets }}'
+
   on-host-test:
     needs: [initialize, docker-unittest-image, build]
     if: needs.initialize.outputs.test_on_host == 'true'
     permissions: {}
-    # TODO(b/372303096): Should have dedicated runner?
     runs-on: [self-hosted, chrobalt-linux-runner]
     name: ${{ matrix.name }}_on_host_tests_${{ matrix.shard }}
     strategy:
@@ -423,16 +676,18 @@ jobs:
         include: ${{ fromJson(needs.initialize.outputs.includes) }}
         config: [devel]
         shard: ${{ fromJson(needs.initialize.outputs.gtest_shards) }}
-    container: ${{ needs.docker-unittest-image.outputs.docker_unittest_tag }}
+    container: ${{ needs.docker-unittest-image.outputs.docker_tag }}
     env:
       TMPDIR: /__w/_temp
       TEST_ARTIFACTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_artifacts
       TEST_RESULTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_results-${{ matrix.shard }}
     steps:
       - name: Restore CI Essentials
-        uses: actions/download-artifact@v4
+        uses: actions/checkout@v4
         with:
-          name: ci-essentials-${{ inputs.platform }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Parse Test Target JSON
         id: test-target-json
         uses: ./.github/actions/test_targets_json
@@ -440,11 +695,66 @@ jobs:
         if: ${{ fromJson(steps.test-target-json.outputs.test_targets_count) > 0 }}
         uses: ./.github/actions/on_host_tests
         with:
+          nightly: ${{ inputs.nightly }}
           test_artifacts_key: ${{ env.TEST_ARTIFACTS_KEY }}
           test_results_key: ${{ env.TEST_RESULTS_KEY }}
           num_gtest_shards: ${{ needs.initialize.outputs.num_gtest_shards }}
     outputs:
       test_targets_json: ${{ steps.test-target-json.outputs.test_targets_json }}
+
+  web-tests:
+    needs: [initialize, docker-webtest-image, build]
+    if: needs.initialize.outputs.web_tests == 'true'
+    permissions: {}
+    runs-on: [self-hosted, chrobalt-linux-runner]
+    name: ${{ matrix.name }}_web_tests
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
+        include: ${{ fromJson(needs.initialize.outputs.includes) }}
+        config: [devel]
+    container:
+      image: ${{ needs.docker-webtest-image.outputs.docker_tag }}
+      volumes:
+        - /runner-cache:/runner-cache
+    env:
+      DEPOT_TOOLS_UPDATE: 0
+      DEPOT_TOOLS_REPORT_BUILD: 0
+      DEPOT_TOOLS_COLLECT_METRICS: 0
+      DEPOT_TOOLS_METRICS: 0
+      TMPDIR: /__w/_temp
+      TEST_ARTIFACTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_artifacts
+    steps:
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+
+      - name: Checkout
+        uses: ./.github/actions/checkout
+        with:
+          path: cobalt/src
+          ref: ${{ github.sha }}
+          # Set fetch-depth to 2 to make checkout faster for pull requests and cobalt_sandbox repo.
+          # Set fetch-dept to 0 for non pull request workflows in production repo which is needed
+          # to properly calculate build id.
+          fetch_depth: ${{ ( github.event_name == 'pull_request' || github.repository == 'youtube/cobalt_sandbox' ) && 2 || 0 }}
+          use_cache: true
+
+      - name: Set Up Depot Tools
+        id: setup-depot-tools
+        uses: ./.github/actions/depot_tools
+        with:
+          run_sync: false
+
+      - name: Run Web Tests
+        uses: ./.github/actions/web_tests
+        with:
+          test_artifacts_key: ${{ env.TEST_ARTIFACTS_KEY }}
+          test_results_key: Blink Web Test Results ${{ github.workflow }}
 
   test-results:
     needs: [initialize, build, on-device-test, on-host-test]
@@ -466,9 +776,11 @@ jobs:
         test_target: ${{ fromJson(needs.on-device-test.outputs.test_targets_json || needs.on-host-test.outputs.test_targets_json) }}
     steps:
       - name: Restore CI Essentials
-        uses: actions/download-artifact@v4
+        uses: actions/checkout@v4
         with:
-          name: ci-essentials-${{ inputs.platform }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
       - name: Extract Test Target Name
         id: extract-target-name
         env:
@@ -495,23 +807,24 @@ jobs:
         shell: bash
       - name: Download Test Results
         if: steps.filter.outputs.skipped != 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: ${{ env.TEST_RESULTS_KEY }}*
           path: results/
-      - name: Process Test Results
+      - name: Test Results
         if: steps.filter.outputs.skipped != 'true'
-        id: process-results
         uses: ./.github/actions/process_test_results
         with:
           target_name: ${{ matrix.test_target }}
-          results_path: results/**/${{ steps.extract-target-name.outputs.test_target }}*.xml
+          results_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*.xml
           datadog_api_key: ${{ secrets.datadog_api_key }}
+          num_gtest_shards: ${{ needs.initialize.outputs.num_gtest_shards }}
       - name: ${{ matrix.test_target }} Device Logs
         if: always() && steps.filter.outputs.skipped != 'true' && needs.initialize.outputs.test_on_device == 'true'
+        continue-on-error: true
         uses: ./.github/actions/print_logs
         with:
-          logfile_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*logcat.txt
+          log_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*logcat.txt
           # TODO: Enable symbolization when it works.
           # symbolize: true
           symbolize: 'false'
@@ -519,8 +832,8 @@ jobs:
         if: always() && steps.filter.outputs.skipped != 'true'
         uses: ./.github/actions/print_logs
         with:
-          logfile_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*log.txt
-          test_status: ${{ steps.process-results.outcome }}
+          log_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*log.txt
+          results_glob: results/**/${{ steps.extract-target-name.outputs.test_target }}*.xml
           # TODO: Enable symbolization when it works.
           # symbolize: ${{ needs.initialize.outputs.test_on_device == 'true' }}
           symbolize: 'false'
@@ -531,16 +844,30 @@ jobs:
     permissions: {}
     runs-on: ubuntu-latest
     name: ${{ matrix.name }}_tests_passing
+    env:
+      TEST_RESULTS_KEY: ${{ matrix.platform }}_${{ matrix.name }}_test_results
     strategy:
       matrix:
         platform: ${{ fromJson(needs.initialize.outputs.platforms) }}
         include: ${{ fromJson(needs.initialize.outputs.includes) }}
         config: [devel]
     steps:
-      - name: Fail
+      - name: Restore CI Essentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: ${{ env.CI_ESSENTIALS }}
+      - name: Download Test Results
+        uses: actions/download-artifact@v5
+        with:
+          pattern: ${{ env.TEST_RESULTS_KEY }}*
+          path: results/
+      - name: Failed Tests
         if: needs.test-results.result == 'failure'
         run: |
-            # TODO: Print a summary of failed tests here.
-            echo "Test jobs failed. See individual failing jobs for details."
-            exit 1
+          # Print test result summary.
+          shopt -s globstar nullglob
+          python3 cobalt/tools/junit_mini_parser.py results/**/*.xml
+          exit 1
         shell: bash

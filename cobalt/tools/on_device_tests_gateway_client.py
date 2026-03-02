@@ -36,20 +36,18 @@ _ON_DEVICE_TESTS_GATEWAY_SERVICE_HOST = (
 _ON_DEVICE_TESTS_GATEWAY_SERVICE_PORT = '50052'
 
 # These paths are hardcoded in various places. DO NOT CHANGE!
-_DIR_ON_DEVICE = '/sdcard/Download'
-_DEPS_ARCHIVE = '/sdcard/chromium_tests_root/deps.tar.gz'
-
 _DIR_ON_DEV_MAP = {
     'android': '/sdcard/Download',
     'raspi': '/home/pi/test/results',
-    'rdk': '/home/rdk/test/results',
+    'rdk': '/data/test/results',
 }
 
 _DEPS_ARCH_MAP = {
     'android': '/sdcard/chromium_tests_root/deps.tar.gz',
     'raspi': '/home/pi/test/',
-    'rdk': '/home/rdk/test/',
+    'rdk': '/data/test/',
 }
+_GCS_ARCHIVE_DEVICE_FAMILIES = ('rdk', 'raspi')
 
 # This is needed because driver expects cobalt.apk, but we publish
 # Cobalt.apk
@@ -172,16 +170,25 @@ def _get_gtest_filter(filter_json_dir: str, target_name: str) -> str:
 
 def _unit_test_files(args: argparse.Namespace, target_name: str) -> List[str]:
   """Builds the list of files for a unit test request."""
+  is_modular_raspi = 'builder-raspi-2-modular' in args.label
+
+  # TODO: b/432536319 - Use flag to determine file ending.
+
   if args.device_family == 'android':
     return [
         f'test_apk={args.gcs_archive_path}/{target_name}-debug.apk',
         f'build_apk={args.gcs_archive_path}/{target_name}-debug.apk',
         f'test_runtime_deps={args.gcs_archive_path}/{target_name}_deps.tar.gz',
     ]
-  elif args.device_family in ['rdk', 'raspi']:
+  elif is_modular_raspi and args.device_family == 'raspi':
     return [
-        f'bin={args.gcs_archive_path}/{target_name}_loader',
-        f'test_runtime_deps={args.gcs_archive_path}/deps.tar.gz',
+        f'bin={args.gcs_archive_path}/{target_name}',
+        f'test_runtime_deps={args.gcs_archive_path}/{target_name}_deps.tar.gz',
+    ]
+  elif args.device_family in _GCS_ARCHIVE_DEVICE_FAMILIES:
+    return [
+        f'bin={args.gcs_archive_path}/{target_name}.py',
+        f'test_runtime_deps={args.gcs_archive_path}/{target_name}_deps.tar.gz',
     ]
   else:
     raise ValueError(f'Unsupported device family: {args.device_family}')
@@ -216,8 +223,9 @@ def _process_test_requests(args: argparse.Namespace) -> List[Dict[str, Any]]:
     raise ValueError(f'--targets is not in JSON format: {e}') from e
 
   for target_data in targets:
+    test_type = args.test_type
 
-    if args.test_type == 'unit_test':
+    if test_type == 'unit_test':
       if not device_type or not device_pool:
         raise ValueError('Dimensions not specified: device_type, device_pool')
       test_target = target_data
@@ -237,7 +245,7 @@ def _process_test_requests(args: argparse.Namespace) -> List[Dict[str, Any]]:
       files = _unit_test_files(args, target_name)
       params = _unit_test_params(args, target_name, dir_on_device)
 
-    elif args.test_type in ('e2e_test', 'yts_test'):
+    elif test_type in ('e2e_test', 'yts_test', 'browser_test', 'yts_wpt_test'):
       test_target = target_data['target']
       test_attempts = target_data.get('test_attempts', '')
       if test_attempts:
@@ -245,11 +253,24 @@ def _process_test_requests(args: argparse.Namespace) -> List[Dict[str, Any]]:
       elif args.test_attempts:
         test_args.extend([f'test_attempts={args.test_attempts}'])
       test_cmd_args = []
-      files = [f'cobalt_path={args.cobalt_path}']
-      params = [f'yt_binary_name={_E2E_DEFAULT_YT_BINARY_NAME}']
+      files = []
+      if test_type in ('browser_test', 'yts_wpt_test'):
+        test_type = 'e2e_test'
+        params = []
+      else:
+        params = [f'yt_binary_name={_E2E_DEFAULT_YT_BINARY_NAME}']
+        if args.device_family in _GCS_ARCHIVE_DEVICE_FAMILIES:
+          params.append(f'gcs_cobalt_archive=gs://{args.cobalt_path}.zip')
+        else:
+          bigstore_path = f'/bigstore/{args.cobalt_path}/{args.artifact_name}'
+          if test_type == 'yts_test':
+            files.append(f'build_apk={bigstore_path}')
+            params.append('app=dev.cobalt.coat')
+          else:
+            files.append(f'cobalt_path={bigstore_path}')
 
     else:
-      raise ValueError(f'Unsupported test type: {args.test_type}')
+      raise ValueError(f'Unsupported test type: {test_type}')
 
     test_requests.append({
         'device_type': device_type,
@@ -259,7 +280,7 @@ def _process_test_requests(args: argparse.Namespace) -> List[Dict[str, Any]]:
         'files': files,
         'params': params,
         'test_target': test_target,
-        'test_type': args.test_type,
+        'test_type': test_type,
     })
 
   return test_requests
@@ -284,7 +305,8 @@ def main() -> int:
       '--token',
       type=str,
       required=True,
-      help='On Device Tests authentication token',
+      help='On Device Tests authentication (GitHub) token. Use GitHub cli '
+      'command `gh auth token` to generate.',
   )
   subparsers = parser.add_subparsers(
       dest='action', help='On-Device tests commands', required=True)
@@ -302,13 +324,14 @@ def main() -> int:
       '--test_type',
       type=str,
       required=True,
-      choices=['unit_test', 'e2e_test', 'yts_test'],
+      choices=[
+          'unit_test', 'e2e_test', 'yts_test', 'browser_test', 'yts_wpt_test'
+      ],
       help='Type of test to run.',
   )
   trigger_args.add_argument(
       '--device_family',
       type=str,
-      choices=['android', 'raspi', 'rdk'],
       help='Family of device to run tests on.',
   )
   trigger_args.add_argument(
@@ -352,13 +375,13 @@ def main() -> int:
       '--test_timeout_sec',
       type=str,
       default='1800',
-      help='Timeout in seconds for the test (default: 1800 seconds).',
+      help='Timeout in seconds for the test.',
   )
   trigger_args.add_argument(
       '--start_timeout_sec',
       type=str,
       default='900',
-      help='Timeout in seconds for the test to start (default: 900 seconds).',
+      help='Timeout in seconds for the test to start.',
   )
 
   # --- Unit Test Arguments ---
@@ -386,6 +409,12 @@ def main() -> int:
       '--cobalt_path',
       type=str,
       help='Path to Cobalt apk.',
+  )
+  e2e_test_group.add_argument(
+      '--artifact_name',
+      type=str,
+      help=('Artifact name, used to specify the cobalt path in non-evergreen'
+            ' workflows'),
   )
 
   # Watch command
